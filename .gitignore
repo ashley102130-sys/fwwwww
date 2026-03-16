@@ -3,5 +3,6 @@ token
 __pycache__/
 ffmpeg.exe
 ffmpeg-7.1-essentials_build/
+bot.log
 *.pyc
 .env

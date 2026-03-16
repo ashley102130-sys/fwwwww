@@ -5,96 +5,183 @@ import random
 import asyncio
 import sys
 import os
+import aiohttp
+import logging
+from dotenv import load_dotenv
+
+# 加載 .env 檔案
+load_dotenv()
+
+# 配置日誌系統，同時輸出到檔案與終端
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s %(levelname)s %(name)s: %(message)s',
+    handlers=[
+        logging.FileHandler("bot.log", encoding="utf-8"),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger("fw_bot")
 
 # ====================== 修改這裡 ======================
 
-# 從獨立檔案讀取 TOKEN
+# 從環境變數讀取 TOKEN
 def load_token():
-    try:
-        with open("token", "r", encoding="utf-8") as f:
-            return f.read().strip()
-    except Exception as e:
-        print(f"❌ 無法讀取 token 檔案：{e}")
+    token = os.getenv("DISCORD_TOKEN")
+    if not token:
+        logger.error("❌ 找不到 DISCORD_TOKEN 環境變數，請檢查 .env 檔案")
         return ""
+    return token.strip()
 
 TOKEN = load_token()
 
-# 不再使用固定 CHANNEL_IDS，會動態追蹤要在哪些頻道洗頻
-active_spam_channels = {}
-
-MESSAGE = [
+# 預設發送內容列表
+MESSAGES = [
     "@everyone 好緊張", 
     "@everyone 廢物",
 ]
+
+# 動態追蹤要在哪些頻道/使用者洗頻，並記錄各自的訊息
+active_spam_channels = {} # {id: {"obj": channel, "msg": str}}
+active_webhooks = {}      # {url: {"nick": nickname, "msg": str}}
+active_audio_guilds = set() # {guild_id} - 記錄哪些伺服器正在無限輪播爆音板
 
 # =======================================================
 
 class MyBot(commands.Bot):
     def __init__(self):
-        # Intents.default() 就足夠處理斜線指令與大部分操作
+        # Intents.default() 並不包含成員（Members）資訊
         intents = discord.Intents.default()
+        intents.message_content = True # 啟用讀取訊息內容的權限
+        intents.members = True         # 啟用獲取伺服器成員資料的權限
         super().__init__(command_prefix="!", intents=intents)
 
     async def setup_hook(self):
         # 開機時同步 slash commands 到 Discord 伺服器
         await self.tree.sync()
-        print("✅ 斜線指令同步完成！")
+        logger.info("✅ 斜線指令同步完成！")
+        
+        # 檢查 Opus 狀態
+        if not discord.opus.is_loaded():
+            logger.info("正在檢查 Opus 編解碼器...")
+            opus_libs = ['libopus-0.x64.dll', 'libopus-0.dll', 'opus.dll', 'libopus.dll']
+            for lib in opus_libs:
+                try:
+                    discord.opus.load_opus(lib)
+                    logger.info(f"✅ 成功載入 Opus: {lib}")
+                    break
+                except :
+                    continue
+            
+            if not discord.opus.is_loaded():
+                logger.warning("⚠️ 找不到 Opus DLL，語音功能（播放音樂）可能無法執行。")
+                logger.warning("提示：這在 Windows 上很常見，通常不需要理會，除非你發現 /laugh 沒有聲音。")
+        else:
+            logger.info("✅ Opus 編解碼器已就緒")
 
 bot = MyBot()
 
 @bot.event
 async def on_ready():
-    print(f"✅ 成功登入為 {bot.user} (ID: {bot.user.id})")
-    print("🤖 機器人已準備就緒，可以使用 /use, /stop 以及 /clear！")
-
-@bot.tree.command(name="use", description="在此頻道或指定頻道啟動自動發送訊息 (激進模式)")
-@discord.app_commands.describe(target_id="目標頻道 ID (請務必提供「純數字 ID」，不要貼上連結)")
-async def use_command(interaction: discord.Interaction, target_id: str = None):
-    # 如果有提供 target_id，嘗試獲取該頻道；否則使用當前頻道
-    if target_id:
-        target_id = target_id.strip()
-        # 檢查是否輸入了連結而非 ID
-        if "discord.gg" in target_id or "http" in target_id:
-            await interaction.response.send_message(
-                "❌ **錯誤：請提供「頻道 ID」而非「連結」！**\n\n"
-                "💡 **如何獲取 ID？**\n"
-                "1. 在 Discord 設定 -> 進階 -> 開啟「開發者模式」。\n"
-                "2. 右鍵點擊目標頻道 -> 點擊「複製頻道 ID」。\n"
-                "⚠️ **重要：** 機器人必須在那台伺服器裡才能運作喔！", 
-                ephemeral=True
+    logger.info(f"✅ 成功登入為 {bot.user} (ID: {bot.user.id})")
+    logger.info("🤖 機器人已準備就緒！")
+    logger.info("可用指令：/use, /nuke, /raid, /stop, /stop_all, /clear, /webhook_use")
+@bot.tree.command(name="raid", description="💣 突擊模式：給機器人邀請連結，它會自動加入並立即對所有頻道開炸")
+@discord.app_commands.describe(invite="伺服器邀請連結 (例如: https://discord.gg/abc123)", content="自訂炸頻內容 (選填)")
+async def raid_command(interaction: discord.Interaction, invite: str, content: str = None):
+    await interaction.response.defer(ephemeral=True)
+    
+    # 解析邀請碼
+    invite = invite.strip()
+    code = invite.split("/")[-1]  # 取出邀請碼部分
+    
+    try:
+        # 用 aiohttp 直接呼叫 Discord API 接受邀請（機器人自動加入）
+        headers = {
+            "Authorization": f"Bot {TOKEN}",
+            "Content-Type": "application/json"
+        }
+        async with aiohttp.ClientSession() as session:
+            resp = await session.post(
+                f"https://discord.com/api/v10/invites/{code}",
+                headers=headers
             )
+            data = await resp.json()
+        
+        if resp.status not in (200, 201):
+            error_msg = data.get("message", "未知錯誤")
+            await interaction.followup.send(f"❌ **加入失敗！** Discord 回傳錯誤：`{error_msg}` (狀態碼: {resp.status})", ephemeral=True)
             return
+        
+        guild_id = int(data.get("guild", {}).get("id", 0))
+        guild_name = data.get("guild", {}).get("name", "未知伺服器")
+        logger.info(f"突擊指令：成功加入伺服器 {guild_name} ({guild_id})")
+        
+        # 等一下讓 bot.get_guild 快取同步
+        await asyncio.sleep(2)
+        
+        guild = bot.get_guild(guild_id)
+        if not guild:
+            await interaction.followup.send(f"⚠️ 已發送加入請求到 **{guild_name}**，但快取尚未同步。請等幾秒後手動使用 `/nuke`。", ephemeral=True)
+            return
+        
+        # 立刻加入所有頻道並開始炸
+        count = 0
+        for channel in guild.text_channels:
+            if channel.id not in active_spam_channels:
+                active_spam_channels[channel.id] = {"obj": channel, "msg": content}
+                count += 1
+        
+        if count > 0:
+            if not spam_task.is_running():
+                spam_task.start()
+            msg_info = f"內容: `{content}`" if content else "內容: `隨機預設`"
+            await interaction.followup.send(f"💣 **突擊成功！**\n已加入伺服器 **{guild_name}** 並在 `{count}` 個頻道開炸！\n{msg_info}", ephemeral=True)
+            logger.info(f"突擊指令：在 {guild_name} 的 {count} 個頻道開始發送")
+        else:
+            await interaction.followup.send(f"✅ 已加入 **{guild_name}**，但找不到可發言的頻道。", ephemeral=True)
+    
+    except Exception as e:
+        logger.exception("突擊指令發生錯誤")
+        await interaction.followup.send(f"❌ 發生錯誤：{e}", ephemeral=True)
 
-        try:
-            channel_id_int = int(target_id)
-            channel = bot.get_channel(channel_id_int)
-            if channel is None:
-                channel = await bot.fetch_channel(channel_id_int)
-        except (ValueError, discord.NotFound, discord.Forbidden):
-            await interaction.response.send_message(
-                f"❌ **找不到頻道或權限不足！** (ID: `{target_id}`)\n\n"
-                "原因可能是：\n"
-                "1. 機器人**尚未加入**該伺服器。\n"
-                "2. ID 輸入錯誤。\n"
-                "3. 機器人沒有在該頻道發言的權限。", 
-                ephemeral=True
-            )
-            return
-        except Exception as e:
-            await interaction.response.send_message(f"❌ 發生未知錯誤：{e}", ephemeral=True)
-            return
-    else:
-        channel = interaction.channel
+class SpamButtonView(discord.ui.View):
+    def __init__(self, content):
+        super().__init__(timeout=None)
+        self.content = content
 
-    channel_id = channel.id
-    if channel_id in active_spam_channels:
-        await interaction.response.send_message(f"⚠️ 頻道 `{channel.name}` (ID: {channel_id}) 已經在自動發送中了！", ephemeral=True)
-    else:
-        active_spam_channels[channel_id] = channel
-        if not spam_task.is_running():
-            spam_task.start()
-        await interaction.response.send_message(f"🚀 已在頻道 `{channel.name}` 啟動激進模式！\n⚠️ 輸入 `/stop` 並提供 ID 即可停止", ephemeral=True)
-        print(f"[資訊] `/use` 指令：開始在頻道 {channel.name} ({channel_id}) 發送")
+    @discord.ui.button(label="💥 點一次發射 10 條訊息", style=discord.ButtonStyle.danger)
+    async def spam_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        msg = self.content if self.content else random.choice(MESSAGES)
+        
+        count = 0
+        for _ in range(10):
+            try:
+                await interaction.followup.send(msg, ephemeral=False)
+                await asyncio.sleep(1.2)
+                count += 1
+            except Exception as e:
+                logger.warning(f"[按鈕] 發送失敗: {type(e).__name__} - {e}")
+                break
+                
+        await interaction.followup.send(f"✅ 成功發送 {count} 條！", ephemeral=True)
+
+@bot.tree.command(name="use", description="在此頻道召喚炸頻控制面板（支援使用者安裝）")
+@discord.app_commands.allowed_installs(guilds=True, users=True)
+@discord.app_commands.allowed_contexts(guilds=True, dms=False, private_channels=True)
+@discord.app_commands.describe(content="自訂發送內容 (選填)")
+async def use_command(interaction: discord.Interaction, content: str = None):
+    view = SpamButtonView(content)
+    await interaction.response.send_message(
+        "🛠️ **控制面板已就緒！**\n"
+        "每次點擊最多發 10 條。\n"
+        "👇 **請點擊下方按鈕**", 
+        view=view, 
+        ephemeral=True
+    )
+    logger.info(f"指令：/use 啟動了控制面板，內容: {content}")
+
 
 @bot.tree.command(name="stop", description="停止在此頻道或指定頻道自動發送訊息")
 @discord.app_commands.describe(target_id="目標頻道 ID (如果要停止遙控的頻道，請提供 ID)")
@@ -103,10 +190,10 @@ async def stop_command(interaction: discord.Interaction, target_id: str = None):
     cid = int(target_id) if target_id else interaction.channel_id
     
     if cid in active_spam_channels:
-        channel_name = active_spam_channels[cid].name
+        channel_name = active_spam_channels[cid]["obj"].name
         del active_spam_channels[cid]
         await interaction.response.send_message(f"🛑 已停止在頻道 `{channel_name}` (ID: {cid}) 的自動發送", ephemeral=True)
-        print(f"[資訊] `/stop` 指令：停止在頻道 {channel_name} ({cid}) 發送")
+        logger.info(f"指令：停止在頻道 {channel_name} ({cid}) 發送")
         
         # 如果所有頻道都停了，就把背景任務關掉省資源
         if not active_spam_channels and spam_task.is_running():
@@ -114,34 +201,98 @@ async def stop_command(interaction: discord.Interaction, target_id: str = None):
     else:
         await interaction.response.send_message(f"⚠️ ID `{cid}` 的頻道目前沒有在自動發送喔！", ephemeral=True)
 
-@tasks.loop(seconds=1.0)
-async def spam_task():
-    msg_content = random.choice(MESSAGE) if isinstance(MESSAGE, list) else MESSAGE
+@bot.tree.command(name="nuke", description="⛔ 核彈模式：刪除頻道、新建頻道並修改伺服器名稱 (極端危險)")
+@discord.app_commands.describe(
+    content="自訂炸頻內容 (選填)", 
+    count="要建立的新頻道數量 (預設 20)", 
+    channel_name="新頻道名稱 (選填)",
+    server_name="新的伺服器名稱 (選填)"
+)
+async def nuke_command(
+    interaction: discord.Interaction, 
+    content: str = None, 
+    count: int = 20, 
+    channel_name: str = "nuclear-strike",
+    server_name: str = None
+):
+    guild = interaction.guild
+    if not guild:
+         await interaction.response.send_message("❌ 此指令只能在伺服器內使用！", ephemeral=True)
+         return
+         
+    # 防止按鈕連點或誤觸
+    await interaction.response.defer(ephemeral=False)
+    await interaction.followup.send("⚠️ **毀滅模式啟動中...** 正在執行伺服器重組程序！")
     
-    # 建立一個清單來存放所有要等待的非同步任務
-    tasks_to_run = []
-    
-    for channel in list(active_spam_channels.values()):
-        # 我們直接使用 interaction 提供的頻道物件來發送
-        tasks_to_run.append(channel.send(msg_content))
-            
-    if tasks_to_run:
-        # 同時發送到所有頻道，並取得結果（忽略錯誤避免整個 loop 崩潰）
-        results = await asyncio.gather(*tasks_to_run, return_exceptions=True)
-        
-        success_count = sum(1 for r in results if not isinstance(r, Exception))
-        print(f"[進度] 嘗試發送了 {len(tasks_to_run)} 個頻道，成功 {success_count} 個")
-        
-        for r in results:
-            if isinstance(r, Exception):
-                print(f"[錯誤] 發送失敗: {r}")
-    else:
-        print("[警告] 找不到任何目標頻道，或者機器人沒有被邀請到該伺服器！")
+    # 修改伺服器名稱
+    if server_name:
+        try:
+            await guild.edit(name=server_name)
+            logger.info(f"核彈指令：更改伺服器名稱為 {server_name}")
+        except Exception as e:
+            logger.warning(f"核彈指令：修改伺服器名稱失敗: {e}")
 
-@spam_task.before_loop
-async def before_spam_task():
-    # 確保在開始發送前，Bot 已經完全登入並準備好
-    await bot.wait_until_ready()
+    # 停止現有的發送任務，避免報錯
+    active_spam_channels.clear()
+    if spam_task.is_running():
+        spam_task.stop()
+
+    deleted_count = 0
+    created_count = 0
+
+    # 1. 刪除所有可見頻道 (平行刪除以加快速度)
+    delete_tasks = []
+    for channel in guild.channels:
+        delete_tasks.append(channel.delete())
+        
+    if delete_tasks:
+        results = await asyncio.gather(*delete_tasks, return_exceptions=True)
+        deleted_count = sum(1 for r in results if not isinstance(r, Exception))
+
+    # 2. 建立新頻道 (平行建立以加快速度)
+    create_tasks = []
+    # 限制最大建立數量以免被 Discord API Block
+    count = max(1, min(count, 50))
+    for _ in range(count):
+        create_tasks.append(guild.create_text_channel(name=channel_name))
+        
+    created_channels = []
+    if create_tasks:
+        results = await asyncio.gather(*create_tasks, return_exceptions=True)
+        for r in results:
+            if not isinstance(r, Exception):
+                created_channels.append(r)
+                created_count += 1
+                
+    # 3. 將新頻道加入轟炸名單
+    for c in created_channels:
+        active_spam_channels[c.id] = {"obj": c, "msg": content}
+        
+    if active_spam_channels and not spam_task.is_running():
+        spam_task.start()
+        
+    logger.info(f"核彈指令：已在 {guild.name} 刪除 {deleted_count} 個頻道，建立 {created_count} 個新頻道開始發送！")
+
+@bot.tree.command(name="stop_all", description="🛑 停火協定：停止目前伺服器內所有發送任務")
+async def stop_all_command(interaction: discord.Interaction):
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("❌ 此指令只能在伺服器內使用！", ephemeral=True)
+        return
+
+    removed_count = 0
+    for cid, data in list(active_spam_channels.items()):
+        if data["obj"].guild.id == guild.id:
+            del active_spam_channels[cid]
+            removed_count += 1
+            
+    if removed_count > 0:
+        await interaction.response.send_message(f"🛑 已停止伺服器內 `{removed_count}` 個發送任務。", ephemeral=True)
+        if not active_spam_channels and spam_task.is_running():
+            spam_task.stop()
+    else:
+        await interaction.response.send_message("⚠️ 此伺服器目前沒有正在進行的發送任務。", ephemeral=True)
+
 
 @bot.tree.command(name="clear", description="快速清理當前頻道的訊息")
 @discord.app_commands.describe(amount="要刪除的訊息數量 (預設 100)")
@@ -152,11 +303,143 @@ async def clear_command(interaction: discord.Interaction, amount: int = 100):
         # purge 會刪除指定數量的訊息
         deleted = await interaction.channel.purge(limit=amount)
         await interaction.followup.send(f"✅ 成功清理了 {len(deleted)} 則訊息！", ephemeral=True)
-        print(f"[資訊] 在頻道 {interaction.channel.name} 清理了 {len(deleted)} 則訊息")
+        logger.info(f"在頻道 {interaction.channel.name} 清理了 {len(deleted)} 則訊息")
     except discord.Forbidden:
         await interaction.followup.send("❌ 我沒有權限刪除訊息 (需要「管理訊息」權限)。", ephemeral=True)
     except discord.HTTPException as e:
         await interaction.followup.send(f"❌ 發生錯誤：{e}", ephemeral=True)
+
+@bot.tree.command(name="webhook_use", description="使用 Webhook URL 啟動自動發送")
+@discord.app_commands.describe(url="Webhook 網址", nickname="顯示名字", content="發送內容 (選填)")
+async def webhook_use_command(interaction: discord.Interaction, url: str, nickname: str = "FW_Bot", content: str = None):
+    url = url.strip()
+    if not url.startswith("https://discord.com/api/webhooks/"):
+        await interaction.response.send_message("❌ 無效的 Webhook 網址！", ephemeral=True)
+        return
+
+    if url in active_webhooks:
+        await interaction.response.send_message("⚠️ 這個 Webhook 已經在發送中了！", ephemeral=True)
+        return
+
+    active_webhooks[url] = {"nick": nickname, "msg": content}
+    
+    if not webhook_spam_task.is_running():
+        webhook_spam_task.start()
+        
+    msg_info = f"内容: `{content}`" if content else "内容: `隨機預設`"
+    await interaction.response.send_message(f"🚀 **Webhook 模式啟動！**\n{msg_info}", ephemeral=True)
+    logger.info(f"Webhook 指令：開始在 {url} 發送 ({msg_info})")
+
+@bot.tree.command(name="webhook_stop", description="停止指定的 Webhook 自動發送")
+@discord.app_commands.describe(url="要停止的 Webhook 完整網址")
+async def webhook_stop_command(interaction: discord.Interaction, url: str):
+    url = url.strip()
+    if url in active_webhooks:
+        del active_webhooks[url]
+        await interaction.response.send_message("🛑 已停止該 Webhook 的自動發送。", ephemeral=True)
+        logger.info(f"Webhook 指令：停止在 {url} 發送")
+        
+        if not active_webhooks and webhook_spam_task.is_running():
+            webhook_spam_task.stop()
+    else:
+        await interaction.response.send_message("⚠️ 該 Webhook 目前沒有在自動發送喔！", ephemeral=True)
+
+class DMSpamButtonView(discord.ui.View):
+    def __init__(self, target_user, content):
+        super().__init__(timeout=None)
+        self.target_user = target_user
+        self.content = content
+
+    @discord.ui.button(label="💥 點一次發射 10 條私訊", style=discord.ButtonStyle.danger)
+    async def spam_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        msg = self.content if self.content else random.choice(MESSAGES)
+        
+        count = 0
+        for _ in range(10):
+            try:
+                await self.target_user.send(msg)
+                await asyncio.sleep(1.2)
+                count += 1
+            except Exception as e:
+                logger.warning(f"[私聊按鈕] 發送失敗: {type(e).__name__} - {e}")
+                break
+                
+        if count > 0:
+            await interaction.followup.send(f"✅ 成功對 `{self.target_user.name}` 發送 {count} 條！", ephemeral=True)
+        else:
+            await interaction.followup.send(f"❌ 無法發送私訊給 `{self.target_user.name}`，可能對方關閉了私訊或機器人被封鎖。", ephemeral=True)
+
+
+@bot.tree.command(name="dm_spam", description="🎯 私聊轟炸：對指定使用者開啟炸頻控制面板")
+@discord.app_commands.describe(user_id="目標 ID", content="自訂內容 (選填)")
+async def dm_spam_command(interaction: discord.Interaction, user_id: str, content: str = None):
+    user_id = user_id.strip()
+    try:
+        uid = int(user_id)
+        user = bot.get_user(uid)
+        if user is None: user = await bot.fetch_user(uid)
+    except:
+        await interaction.response.send_message("❌ 找不到使用者！請確認 ID 是否正確。", ephemeral=True)
+        return
+
+    view = DMSpamButtonView(user, content)
+    await interaction.response.send_message(
+        f"🎯 **私聊轟炸面板已就緒！** 目標: `{user.name}`\n"
+        "每次點擊最多私聊發送 10 條。\n"
+        "👇 **請點擊下方按鈕**", 
+        view=view, 
+        ephemeral=True
+    )
+    logger.info(f"指令：/dm_spam 啟動了對 {user.name} 的控制面板")
+
+@bot.tree.command(name="set_msg", description="⚙️ 全局設定：更改預設的炸頻內容清單 (使用空格分隔多條內容)")
+@discord.app_commands.describe(text="範例: 內容一 內容二 內容三 (機器人會隨機挑選發送)")
+async def set_msg_command(interaction: discord.Interaction, text: str):
+    global MESSAGES
+    new_msgs = [m.strip() for m in text.split(" ") if m.strip()]
+    if not new_msgs:
+        await interaction.response.send_message("❌ 內容不能為空！", ephemeral=True)
+        return
+    
+    MESSAGES = new_msgs
+    await interaction.response.send_message(f"✅ 預設內容已更新！現在包含 `{len(MESSAGES)}` 條訊息。", ephemeral=True)
+    logger.info(f"指令：更新全局訊息清單為: {MESSAGES}")
+
+@tasks.loop(seconds=1.0)
+async def spam_task():
+    # 處理頻道與私聊
+    tasks_to_run = []
+    
+    # 處理頻道
+    for cid, data in list(active_spam_channels.items()):
+        msg = data["msg"] if data["msg"] else random.choice(MESSAGES)
+        tasks_to_run.append(data["obj"].send(msg))
+            
+    if tasks_to_run:
+        logger.info(f"[spam_task] 嘗試發送到 {len(tasks_to_run)} 個目標")
+        results = await asyncio.gather(*tasks_to_run, return_exceptions=True)
+        for r in results:
+            if isinstance(r, Exception):
+                logger.warning(f"[spam_task] 發送失敗: {type(r).__name__}: {r}")
+
+@tasks.loop(seconds=1.0)
+async def webhook_spam_task():
+    if not active_webhooks:
+        return
+
+    async with aiohttp.ClientSession() as session:
+        tasks_to_run = []
+        for url, data in list(active_webhooks.items()):
+            msg = data["msg"] if data["msg"] else random.choice(MESSAGES)
+            payload = {
+                "content": msg,
+                "username": data["nick"]
+            }
+            tasks_to_run.append(session.post(url, json=payload))
+            
+        if tasks_to_run:
+            await asyncio.gather(*tasks_to_run, return_exceptions=True)
 
 @bot.tree.command(name="join", description="讓機器人加入你所在的語音頻道")
 async def join_command(interaction: discord.Interaction):
@@ -181,7 +464,6 @@ async def join_command(interaction: discord.Interaction):
     await channel.connect()
     await interaction.response.send_message(f"✅ 已成功加入語音頻道: {channel.name}")
 
-
 @bot.tree.command(name="leave", description="讓機器人離開語音頻道")
 async def leave_command(interaction: discord.Interaction):
     if interaction.guild.voice_client:
@@ -190,21 +472,30 @@ async def leave_command(interaction: discord.Interaction):
     else:
         await interaction.response.send_message("⚠️ 我目前不在任何語音頻道裡喔！", ephemeral=True)
 
+@bot.tree.command(name="laugh", description="開啟/關閉無限播放資料庫中的爆音板")
+async def laugh_command(interaction: discord.Interaction):
+    guild_id = interaction.guild_id
+    
+    if guild_id in active_audio_guilds:
+        # 如果已經在播，就馬上關掉
+        active_audio_guilds.remove(guild_id)
+        if interaction.guild.voice_client and interaction.guild.voice_client.is_playing():
+            interaction.guild.voice_client.stop()
+        await interaction.response.send_message("🛑 **已停止爆音板無限輪播！**")
+        logger.info(f"指令：在伺服器 {interaction.guild.name} 停止輪播爆音板")
+        return
 
-@bot.tree.command(name="laugh", description="隨機播放資料庫中的爆音板")
-    print(f"[資訊] 收到 `/laugh` 指令，嘗試在伺服器 {interaction.guild.name} 播放")
+    logger.info(f"收到 `/laugh` 指令，開始在 {interaction.guild.name} 無限輪播")
     
     # 確保已經連上語音
     voice_client = interaction.guild.voice_client
     if not voice_client:
         await interaction.response.send_message("❌ 我還沒加入語音頻道！請先使用 `/join`", ephemeral=True)
-        print("[警告] 播放失敗：機器人不在語音頻道中")
         return
 
     # 檢查語音連線狀態
     if not voice_client.is_connected():
         await interaction.response.send_message("❌ 語音連線異常，請嘗試重新 `/join`", ephemeral=True)
-        print("[錯誤] 播放失敗：voice_client 雖然存在但未連線")
         return
 
     library_path = "library"
@@ -212,54 +503,81 @@ async def leave_command(interaction: discord.Interaction):
         await interaction.response.send_message("❌ 找不到 `library` 資料夾，或裡面沒有任何音檔！", ephemeral=True)
         return
 
-    # 隨機挑選一個音檔
+    # 加入活躍名單
+    active_audio_guilds.add(guild_id)
+    await interaction.response.send_message("🔊 **已開啟爆音板無限輪播模式！** (再次輸入 `/laugh` 即可停止)")
+    
+    # 啟動輪播機制
+    play_next_audio(interaction.guild)
+
+def play_next_audio(guild: discord.Guild):
+    # 只有繼續在活躍清單裡才播放
+    if guild.id not in active_audio_guilds:
+        return
+        
+    voice_client = guild.voice_client
+    if not voice_client or not voice_client.is_connected():
+        active_audio_guilds.discard(guild.id)
+        return
+        
+    library_path = "library"
     files = [f for f in os.listdir(library_path) if f.endswith(('.wav', '.mp3', '.ogg'))]
     if not files:
-        await interaction.response.send_message("❌ `library` 資料夾裡沒有支援的音檔 (.wav, .mp3, .ogg)！", ephemeral=True)
+        active_audio_guilds.discard(guild.id)
         return
         
     selected_file = random.choice(files)
     file_path = os.path.join(library_path, selected_file)
-    print(f"[資訊] 選定播放檔案: {file_path}")
-
-    if voice_client.is_playing():
-        print("[資訊] 正在播放中，強制停止並切換")
-        voice_client.stop()
-        
+    
     try:
-        # 檢查 ffmpeg.exe 是否存在
-        ffmpeg_exe = "./ffmpeg.exe"
-        if not os.path.exists(ffmpeg_exe):
-            print(f"[錯誤] 找不到 ffmpeg.exe 路徑: {os.path.abspath(ffmpeg_exe)}")
-            await interaction.response.send_message("❌ 伺服器端找不到 `ffmpeg.exe`，請確認檔案位置。", ephemeral=True)
-            return
-
-        # 使用下載下來的獨立 ffmpeg.exe 播放音檔
-        print(f"[資訊] 正在啟動 FFmpeg 播放: {selected_file}")
-        audio_source = discord.FFmpegPCMAudio(executable=ffmpeg_exe, source=file_path)
+        ffmpeg_options = {'options': '-vn'}
+        ffmpeg_executable = "ffmpeg"
+        if os.path.exists("./ffmpeg.exe"):
+            ffmpeg_executable = "./ffmpeg.exe"
+            
+        audio_source = discord.FFmpegPCMAudio(
+            executable=ffmpeg_executable,
+            source=file_path,
+            **ffmpeg_options
+        )
         
-        # 增加 error 處理 callback
-        def handle_error(err):
-            if err:
-                print(f"[非同步錯誤] 播放時出錯: {err}")
+        # 播放完畢後的回呼函數
+        def after_playing(error):
+            if error:
+                logger.error(f"[輪播錯誤] {error}")
+            # 等待 1 秒後撥放下一首，避免被 API Rate Limit，使用 asyncio run_coroutine_threadsafe
+            if guild.id in active_audio_guilds:
+                # 使用 bot 的 event loop 重新調用 play_next_audio
+                bot.loop.call_later(1.0, play_next_audio, guild)
 
-        voice_client.play(audio_source, after=handle_error)
-        await interaction.response.send_message(f"🔊 正在大聲播放: `{selected_file}`")
-        print(f"[成功] 在伺服器 {interaction.guild.name} 順利開始播放 {selected_file}")
+        if not voice_client.is_playing():
+            voice_client.play(audio_source, after=after_playing)
+            logger.info(f"[輪播] 正在伺服器 {guild.name} 播放: {selected_file}")
+            
     except Exception as e:
-        await interaction.response.send_message(f"❌ 播放音檔時發生嚴重錯誤: {e}", ephemeral=True)
-        print(f"[嚴重錯誤] play() 調用失敗: {e}")
-        import traceback
-        traceback.print_exc()
+        logger.exception(f"[輪播失敗] {e}")
+        # 如果出錯，過幾秒再試一次
+        bot.loop.call_later(3.0, play_next_audio, guild)
+
 
 if __name__ == "__main__":
     if not TOKEN.strip():
-        print("錯誤：TOKEN 為空")
+        logger.error("錯誤：TOKEN 為空，請檢查 .env 檔案")
         sys.exit(1)
         
     try:
         bot.run(TOKEN)
+    except discord.PrivilegedIntentsRequired:
+        logger.error("\n" + "="*50 +
+                     "\n❌ 啟動失敗：缺少「Message Content Intent」權限！"
+                     "\n請到 Discord Developer Portal 啟用它："
+                     "\n1. 進入 https://discord.com/developers/applications"
+                     "\n2. 選擇你的 Bot -> Bot 分頁"
+                     "\n3. 找到 'Privileged Gateway Intents' 區塊"
+                     "\n4. 開啟 'Message Content Intent'"
+                     "\n5. 儲存變更後重新執行腳本。"
+                     "\n" + "="*50)
     except discord.LoginFailure:
-        print("❌ 登入失敗！機器人 Token 可能錯誤。")
+        logger.error("❌ 登入失敗！機器人 Token 可能錯誤。")
     except Exception as e:
-        print(f"❌ 發生未知的嚴重錯誤：{e}")
+        logger.exception("❌ 發生未知的嚴重錯誤")
