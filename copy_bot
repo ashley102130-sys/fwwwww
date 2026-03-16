@@ -38,31 +38,48 @@ async def on_ready():
     print(f"✅ 成功登入為 {bot.user} (ID: {bot.user.id})")
     print("🤖 機器人已準備就緒，可以使用 /use, /stop 以及 /clear！")
 
-@bot.tree.command(name="use", description="在此頻道啟動自動發送訊息 (激進模式)")
-async def use_command(interaction: discord.Interaction):
-    channel_id = interaction.channel_id
-    if channel_id in active_spam_channels:
-        await interaction.response.send_message("⚠️ 這個頻道已經在自動發送中了！如果要停止，請輸入 `/stop`", ephemeral=True)
+@bot.tree.command(name="use", description="在此頻道或指定頻道啟動自動發送訊息 (激進模式)")
+@discord.app_commands.describe(target_id="目標頻道 ID (如果不在該頻道下指令，請提供 ID)")
+async def use_command(interaction: discord.Interaction, target_id: str = None):
+    # 如果有提供 target_id，嘗試獲取該頻道；否則使用當前頻道
+    if target_id:
+        try:
+            channel = bot.get_channel(int(target_id))
+            if channel is None:
+                channel = await bot.fetch_channel(int(target_id))
+        except Exception:
+            await interaction.response.send_message(f"❌ 找不到 ID 為 `{target_id}` 的頻道，請確認機器人是否在該伺服器內。", ephemeral=True)
+            return
     else:
-        active_spam_channels[channel_id] = interaction.channel
+        channel = interaction.channel
+
+    channel_id = channel.id
+    if channel_id in active_spam_channels:
+        await interaction.response.send_message(f"⚠️ 頻道 `{channel.name}` (ID: {channel_id}) 已經在自動發送中了！", ephemeral=True)
+    else:
+        active_spam_channels[channel_id] = channel
         if not spam_task.is_running():
             spam_task.start()
-        await interaction.response.send_message("🚀 已在此頻道啟動激進模式！(間隔約 1 秒)\n⚠️ 輸入 `/stop` 即可停止", ephemeral=True)
-        print(f"[資訊] 已收到 `/use` 指令：開始在頻道 {interaction.channel.name} 發送")
+        await interaction.response.send_message(f"🚀 已在頻道 `{channel.name}` 啟動激進模式！\n⚠️ 輸入 `/stop` 並提供 ID 即可停止", ephemeral=True)
+        print(f"[資訊] `/use` 指令：開始在頻道 {channel.name} ({channel_id}) 發送")
 
-@bot.tree.command(name="stop", description="停止在此頻道自動發送訊息")
-async def stop_command(interaction: discord.Interaction):
-    channel_id = interaction.channel_id
-    if channel_id in active_spam_channels:
-        del active_spam_channels[channel_id]
-        await interaction.response.send_message("🛑 已停止在此頻道自動發送訊息", ephemeral=True)
-        print(f"[資訊] 已收到 `/stop` 指令：停止在頻道 {interaction.channel.name} 發送")
+@bot.tree.command(name="stop", description="停止在此頻道或指定頻道自動發送訊息")
+@discord.app_commands.describe(target_id="目標頻道 ID (如果要停止遙控的頻道，請提供 ID)")
+async def stop_command(interaction: discord.Interaction, target_id: str = None):
+    # 定義目標 ID
+    cid = int(target_id) if target_id else interaction.channel_id
+    
+    if cid in active_spam_channels:
+        channel_name = active_spam_channels[cid].name
+        del active_spam_channels[cid]
+        await interaction.response.send_message(f"🛑 已停止在頻道 `{channel_name}` (ID: {cid}) 的自動發送", ephemeral=True)
+        print(f"[資訊] `/stop` 指令：停止在頻道 {channel_name} ({cid}) 發送")
         
         # 如果所有頻道都停了，就把背景任務關掉省資源
         if not active_spam_channels and spam_task.is_running():
             spam_task.stop()
     else:
-        await interaction.response.send_message("⚠️ 目前這個頻道沒有在自動發送喔！", ephemeral=True)
+        await interaction.response.send_message(f"⚠️ ID `{cid}` 的頻道目前沒有在自動發送喔！", ephemeral=True)
 
 @tasks.loop(seconds=1.0)
 async def spam_task():
