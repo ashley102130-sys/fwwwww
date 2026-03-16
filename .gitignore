@@ -1,0 +1,7 @@
+token
+.venv/
+__pycache__/
+ffmpeg.exe
+ffmpeg-7.1-essentials_build/
+*.pyc
+.env

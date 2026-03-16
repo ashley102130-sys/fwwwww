@@ -8,7 +8,16 @@ import os
 
 # ====================== 修改這裡 ======================
 
-TOKEN = "MTQ4Mjc1ODIzODU1MzUwNTg0Mg.GUuB_u.56UZhkaKMLwAmqJgsSOvVA4F_s6TgLMLhNxAHg"
+# 從獨立檔案讀取 TOKEN
+def load_token():
+    try:
+        with open("token", "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception as e:
+        print(f"❌ 無法讀取 token 檔案：{e}")
+        return ""
+
+TOKEN = load_token()
 
 # 不再使用固定 CHANNEL_IDS，會動態追蹤要在哪些頻道洗頻
 active_spam_channels = {}
