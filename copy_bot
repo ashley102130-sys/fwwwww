@@ -1,0 +1,189 @@
+# -*- coding: utf-8 -*-
+import discord
+from discord.ext import commands, tasks
+import random
+import asyncio
+import sys
+import os
+
+# ====================== 修改這裡 ======================
+
+TOKEN = "MTQ4Mjc1ODIzODU1MzUwNTg0Mg.GUuB_u.56UZhkaKMLwAmqJgsSOvVA4F_s6TgLMLhNxAHg"
+
+# 不再使用固定 CHANNEL_IDS，會動態追蹤要在哪些頻道洗頻
+active_spam_channels = {}
+
+MESSAGE = [
+    "@everyone 好緊張", 
+    "@everyone 廢物",
+]
+
+# =======================================================
+
+class MyBot(commands.Bot):
+    def __init__(self):
+        # Intents.default() 就足夠處理斜線指令與大部分操作
+        intents = discord.Intents.default()
+        super().__init__(command_prefix="!", intents=intents)
+
+    async def setup_hook(self):
+        # 開機時同步 slash commands 到 Discord 伺服器
+        await self.tree.sync()
+        print("✅ 斜線指令同步完成！")
+
+bot = MyBot()
+
+@bot.event
+async def on_ready():
+    print(f"✅ 成功登入為 {bot.user} (ID: {bot.user.id})")
+    print("🤖 機器人已準備就緒，可以使用 /use, /stop 以及 /clear！")
+
+@bot.tree.command(name="use", description="在此頻道啟動自動發送訊息 (激進模式)")
+async def use_command(interaction: discord.Interaction):
+    channel_id = interaction.channel_id
+    if channel_id in active_spam_channels:
+        await interaction.response.send_message("⚠️ 這個頻道已經在自動發送中了！如果要停止，請輸入 `/stop`", ephemeral=True)
+    else:
+        active_spam_channels[channel_id] = interaction.channel
+        if not spam_task.is_running():
+            spam_task.start()
+        await interaction.response.send_message("🚀 已在此頻道啟動激進模式！(間隔約 1 秒)\n⚠️ 輸入 `/stop` 即可停止", ephemeral=True)
+        print(f"[資訊] 已收到 `/use` 指令：開始在頻道 {interaction.channel.name} 發送")
+
+@bot.tree.command(name="stop", description="停止在此頻道自動發送訊息")
+async def stop_command(interaction: discord.Interaction):
+    channel_id = interaction.channel_id
+    if channel_id in active_spam_channels:
+        del active_spam_channels[channel_id]
+        await interaction.response.send_message("🛑 已停止在此頻道自動發送訊息", ephemeral=True)
+        print(f"[資訊] 已收到 `/stop` 指令：停止在頻道 {interaction.channel.name} 發送")
+        
+        # 如果所有頻道都停了，就把背景任務關掉省資源
+        if not active_spam_channels and spam_task.is_running():
+            spam_task.stop()
+    else:
+        await interaction.response.send_message("⚠️ 目前這個頻道沒有在自動發送喔！", ephemeral=True)
+
+@tasks.loop(seconds=1.0)
+async def spam_task():
+    msg_content = random.choice(MESSAGE) if isinstance(MESSAGE, list) else MESSAGE
+    
+    # 建立一個清單來存放所有要等待的非同步任務
+    tasks_to_run = []
+    
+    for channel in list(active_spam_channels.values()):
+        # 我們直接使用 interaction 提供的頻道物件來發送
+        tasks_to_run.append(channel.send(msg_content))
+            
+    if tasks_to_run:
+        # 同時發送到所有頻道，並取得結果（忽略錯誤避免整個 loop 崩潰）
+        results = await asyncio.gather(*tasks_to_run, return_exceptions=True)
+        
+        success_count = sum(1 for r in results if not isinstance(r, Exception))
+        print(f"[進度] 嘗試發送了 {len(tasks_to_run)} 個頻道，成功 {success_count} 個")
+        
+        for r in results:
+            if isinstance(r, Exception):
+                print(f"[錯誤] 發送失敗: {r}")
+    else:
+        print("[警告] 找不到任何目標頻道，或者機器人沒有被邀請到該伺服器！")
+
+@spam_task.before_loop
+async def before_spam_task():
+    # 確保在開始發送前，Bot 已經完全登入並準備好
+    await bot.wait_until_ready()
+
+@bot.tree.command(name="clear", description="快速清理當前頻道的訊息")
+@discord.app_commands.describe(amount="要刪除的訊息數量 (預設 100)")
+async def clear_command(interaction: discord.Interaction, amount: int = 100):
+    # 因為刪除訊息可能需要一點時間，先 defer 回應避免 Timeout 錯誤
+    await interaction.response.defer(ephemeral=True)
+    try:
+        # purge 會刪除指定數量的訊息
+        deleted = await interaction.channel.purge(limit=amount)
+        await interaction.followup.send(f"✅ 成功清理了 {len(deleted)} 則訊息！", ephemeral=True)
+        print(f"[資訊] 在頻道 {interaction.channel.name} 清理了 {len(deleted)} 則訊息")
+    except discord.Forbidden:
+        await interaction.followup.send("❌ 我沒有權限刪除訊息 (需要「管理訊息」權限)。", ephemeral=True)
+    except discord.HTTPException as e:
+        await interaction.followup.send(f"❌ 發生錯誤：{e}", ephemeral=True)
+
+@bot.tree.command(name="join", description="讓機器人加入你所在的語音頻道")
+async def join_command(interaction: discord.Interaction):
+    if not interaction.user.voice:
+        await interaction.response.send_message("❌ 你必須先加入一個語音頻道！", ephemeral=True)
+        return
+        
+    channel = interaction.user.voice.channel
+    
+    # 檢查是否已經在頻道內
+    if interaction.guild.voice_client:
+        if interaction.guild.voice_client.channel.id == channel.id:
+            await interaction.response.send_message("⚠️ 我已經在這個頻道裡了！", ephemeral=True)
+            return
+        else:
+            # 移動到新頻道
+            await interaction.guild.voice_client.move_to(channel)
+            await interaction.response.send_message(f"🏃 已移動到語音頻道: {channel.name}")
+            return
+
+    # 加入頻道
+    await channel.connect()
+    await interaction.response.send_message(f"✅ 已成功加入語音頻道: {channel.name}")
+
+
+@bot.tree.command(name="leave", description="讓機器人離開語音頻道")
+async def leave_command(interaction: discord.Interaction):
+    if interaction.guild.voice_client:
+        await interaction.guild.voice_client.disconnect()
+        await interaction.response.send_message("👋 已離開語音頻道！")
+    else:
+        await interaction.response.send_message("⚠️ 我目前不在任何語音頻道裡喔！", ephemeral=True)
+
+
+@bot.tree.command(name="laugh", description="隨機播放資料庫中的爆音板")
+async def laugh_command(interaction: discord.Interaction):
+    # 確保已經連上語音
+    voice_client = interaction.guild.voice_client
+    if not voice_client:
+        await interaction.response.send_message("❌ 我還沒加入語音頻道！請先使用 `/join`", ephemeral=True)
+        return
+
+    library_path = "library"
+    if not os.path.exists(library_path) or not os.listdir(library_path):
+        await interaction.response.send_message("❌ 找不到 `library` 資料夾，或裡面沒有任何音檔！", ephemeral=True)
+        return
+
+    # 隨機挑選一個音檔
+    files = [f for f in os.listdir(library_path) if f.endswith(('.wav', '.mp3', '.ogg'))]
+    if not files:
+        await interaction.response.send_message("❌ `library` 資料夾裡沒有支援的音檔 (.wav, .mp3, .ogg)！", ephemeral=True)
+        return
+        
+    selected_file = random.choice(files)
+    file_path = os.path.join(library_path, selected_file)
+
+    if voice_client.is_playing():
+        voice_client.stop() # 如果正在播放，強制切歌
+        
+    try:
+        # 使用下載下來的獨立 ffmpeg.exe 播放音檔
+        audio_source = discord.FFmpegPCMAudio(executable="./ffmpeg.exe", source=file_path)
+        voice_client.play(audio_source)
+        await interaction.response.send_message(f"🔊 正在大聲播放: `{selected_file}`")
+        print(f"[資訊] 在伺服器 {interaction.guild.name} 播放了 {selected_file}")
+    except Exception as e:
+        await interaction.response.send_message(f"❌ 播放音檔時發生錯誤: {e}", ephemeral=True)
+        print(f"[錯誤] 播放音檔失敗: {e}")
+
+if __name__ == "__main__":
+    if not TOKEN.strip():
+        print("錯誤：TOKEN 為空")
+        sys.exit(1)
+        
+    try:
+        bot.run(TOKEN)
+    except discord.LoginFailure:
+        print("❌ 登入失敗！機器人 Token 可能錯誤。")
+    except Exception as e:
+        print(f"❌ 發生未知的嚴重錯誤：{e}")

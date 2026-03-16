@@ -1,0 +1,7 @@
+requests
+discord.py
+python-dotenv
+aiohttp
+black
+ruff
+ipython
