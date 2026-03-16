@@ -192,11 +192,19 @@ async def leave_command(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="laugh", description="隨機播放資料庫中的爆音板")
-async def laugh_command(interaction: discord.Interaction):
+    print(f"[資訊] 收到 `/laugh` 指令，嘗試在伺服器 {interaction.guild.name} 播放")
+    
     # 確保已經連上語音
     voice_client = interaction.guild.voice_client
     if not voice_client:
         await interaction.response.send_message("❌ 我還沒加入語音頻道！請先使用 `/join`", ephemeral=True)
+        print("[警告] 播放失敗：機器人不在語音頻道中")
+        return
+
+    # 檢查語音連線狀態
+    if not voice_client.is_connected():
+        await interaction.response.send_message("❌ 語音連線異常，請嘗試重新 `/join`", ephemeral=True)
+        print("[錯誤] 播放失敗：voice_client 雖然存在但未連線")
         return
 
     library_path = "library"
@@ -212,19 +220,37 @@ async def laugh_command(interaction: discord.Interaction):
         
     selected_file = random.choice(files)
     file_path = os.path.join(library_path, selected_file)
+    print(f"[資訊] 選定播放檔案: {file_path}")
 
     if voice_client.is_playing():
-        voice_client.stop() # 如果正在播放，強制切歌
+        print("[資訊] 正在播放中，強制停止並切換")
+        voice_client.stop()
         
     try:
+        # 檢查 ffmpeg.exe 是否存在
+        ffmpeg_exe = "./ffmpeg.exe"
+        if not os.path.exists(ffmpeg_exe):
+            print(f"[錯誤] 找不到 ffmpeg.exe 路徑: {os.path.abspath(ffmpeg_exe)}")
+            await interaction.response.send_message("❌ 伺服器端找不到 `ffmpeg.exe`，請確認檔案位置。", ephemeral=True)
+            return
+
         # 使用下載下來的獨立 ffmpeg.exe 播放音檔
-        audio_source = discord.FFmpegPCMAudio(executable="./ffmpeg.exe", source=file_path)
-        voice_client.play(audio_source)
+        print(f"[資訊] 正在啟動 FFmpeg 播放: {selected_file}")
+        audio_source = discord.FFmpegPCMAudio(executable=ffmpeg_exe, source=file_path)
+        
+        # 增加 error 處理 callback
+        def handle_error(err):
+            if err:
+                print(f"[非同步錯誤] 播放時出錯: {err}")
+
+        voice_client.play(audio_source, after=handle_error)
         await interaction.response.send_message(f"🔊 正在大聲播放: `{selected_file}`")
-        print(f"[資訊] 在伺服器 {interaction.guild.name} 播放了 {selected_file}")
+        print(f"[成功] 在伺服器 {interaction.guild.name} 順利開始播放 {selected_file}")
     except Exception as e:
-        await interaction.response.send_message(f"❌ 播放音檔時發生錯誤: {e}", ephemeral=True)
-        print(f"[錯誤] 播放音檔失敗: {e}")
+        await interaction.response.send_message(f"❌ 播放音檔時發生嚴重錯誤: {e}", ephemeral=True)
+        print(f"[嚴重錯誤] play() 調用失敗: {e}")
+        import traceback
+        traceback.print_exc()
 
 if __name__ == "__main__":
     if not TOKEN.strip():
