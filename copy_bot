@@ -472,6 +472,21 @@ async def leave_command(interaction: discord.Interaction):
     else:
         await interaction.response.send_message("⚠️ 我目前不在任何語音頻道裡喔！", ephemeral=True)
 
+class AudioControlView(discord.ui.View):
+    def __init__(self):
+        # 設定為 None，讓按鈕永遠不會過期失效
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="⏭️ 跳過當前音檔", style=discord.ButtonStyle.primary)
+    async def skip_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        voice_client = interaction.guild.voice_client
+        if voice_client and voice_client.is_playing():
+            voice_client.stop()
+            await interaction.response.send_message("⏭️ 已跳過！正在切換下一首...", ephemeral=True)
+            logger.info(f"使用者 {interaction.user.name} 點擊了跳過音檔")
+        else:
+            await interaction.response.send_message("⚠️ 目前沒有正在播放的音檔喔！", ephemeral=True)
+
 @bot.tree.command(name="laugh", description="開啟/關閉無限播放資料庫中的爆音板")
 async def laugh_command(interaction: discord.Interaction):
     guild_id = interaction.guild_id
@@ -505,7 +520,12 @@ async def laugh_command(interaction: discord.Interaction):
 
     # 加入活躍名單
     active_audio_guilds.add(guild_id)
-    await interaction.response.send_message("🔊 **已開啟爆音板無限輪播模式！** (再次輸入 `/laugh` 即可停止)")
+    view = AudioControlView()
+    await interaction.response.send_message(
+        "🔊 **已開啟無限輪播模式！** (再次輸入 `/laugh` 即可停止)\n"
+        "👇 點擊下方按鈕可以跳過當前正在播放的音檔。",
+        view=view
+    )
     
     # 啟動輪播機制
     play_next_audio(interaction.guild)
