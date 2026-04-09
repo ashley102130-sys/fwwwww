@@ -1,9 +1,14 @@
 # -*- coding: utf-8 -*-
+import asyncio
+import sys
+
+# ✅ 修正 Windows 上 aiohttp DNS 解析失敗的問題 (ProactorEventLoop 不相容)
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 import discord
 from discord.ext import commands, tasks
 import random
-import asyncio
-import sys
+
 import os
 import aiohttp
 import logging
@@ -155,17 +160,14 @@ class SpamButtonView(discord.ui.View):
         await interaction.response.defer(ephemeral=True)
         msg = self.content if self.content else random.choice(MESSAGES)
         
-        count = 0
-        for _ in range(10):
-            try:
-                await interaction.followup.send(msg, ephemeral=False)
-                await asyncio.sleep(1.2)
-                count += 1
-            except Exception as e:
-                logger.warning(f"[按鈕] 發送失敗: {type(e).__name__} - {e}")
-                break
-                
-        await interaction.followup.send(f"✅ 成功發送 {count} 條！", ephemeral=True)
+        # 平行發送，不等待每條，速度提升 ~10x
+        tasks = [interaction.followup.send(msg, ephemeral=False) for _ in range(10)]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        count = sum(1 for r in results if not isinstance(r, Exception))
+        try:
+            await interaction.followup.send(f"✅ 成功發送 {count} 條！", ephemeral=True)
+        except Exception:
+            pass  # 429 rate limit 在確認訊息上，無視即可（垃圾訊息已發出）
 
 @bot.tree.command(name="use", description="在此頻道召喚炸頻控制面板（支援使用者安裝）")
 @discord.app_commands.allowed_installs(guilds=True, users=True)
@@ -355,20 +357,18 @@ class DMSpamButtonView(discord.ui.View):
         await interaction.response.defer(ephemeral=True)
         msg = self.content if self.content else random.choice(MESSAGES)
         
-        count = 0
-        for _ in range(10):
-            try:
-                await self.target_user.send(msg)
-                await asyncio.sleep(1.2)
-                count += 1
-            except Exception as e:
-                logger.warning(f"[私聊按鈕] 發送失敗: {type(e).__name__} - {e}")
-                break
-                
-        if count > 0:
-            await interaction.followup.send(f"✅ 成功對 `{self.target_user.name}` 發送 {count} 條！", ephemeral=True)
-        else:
-            await interaction.followup.send(f"❌ 無法發送私訊給 `{self.target_user.name}`，可能對方關閉了私訊或機器人被封鎖。", ephemeral=True)
+        # 平行發送所有私訊
+        tasks = [self.target_user.send(msg) for _ in range(10)]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        count = sum(1 for r in results if not isinstance(r, Exception))
+        
+        try:
+            if count > 0:
+                await interaction.followup.send(f"✅ 成功對 `{self.target_user.name}` 發送 {count} 條！", ephemeral=True)
+            else:
+                await interaction.followup.send(f"❌ 無法發送私訊給 `{self.target_user.name}`，可能對方關閉了私訊或機器人被封鎖。", ephemeral=True)
+        except Exception:
+            pass  # 429 rate limit，確認訊息失敗無視
 
 
 @bot.tree.command(name="dm_spam", description="🎯 私聊轟炸：對指定使用者開啟炸頻控制面板")
@@ -393,6 +393,59 @@ async def dm_spam_command(interaction: discord.Interaction, user_id: str, conten
     )
     logger.info(f"指令：/dm_spam 啟動了對 {user.name} 的控制面板")
 
+class RandomFileView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="🎲 再抽一個", style=discord.ButtonStyle.secondary)
+    async def reroll_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        library_path = "library"
+        files = [f for f in os.listdir(library_path) if os.path.isfile(os.path.join(library_path, f))]
+        if not files:
+            await interaction.response.send_message("❌ `library` 資料夾是空的！", ephemeral=True)
+            return
+
+        selected_file = random.choice(files)
+        file_path = os.path.join(library_path, selected_file)
+
+        try:
+            await interaction.response.defer()
+            await interaction.followup.send(
+                f"🎲 再抽一次: `{selected_file}`",
+                file=discord.File(file_path),
+                view=RandomFileView()
+            )
+            logger.info(f"[再抽] 發送了 {selected_file}")
+        except Exception as e:
+            await interaction.followup.send(f"❌ 發送失敗：{e}", ephemeral=True)
+
+@bot.tree.command(name="send_file", description="📁 隨機發送 library 資料夾中的一個檔案到聊天室")
+async def send_file_command(interaction: discord.Interaction):
+    library_path = "library"
+    if not os.path.exists(library_path):
+        await interaction.response.send_message("❌ 找不到 `library` 資料夾！", ephemeral=True)
+        return
+
+    files = [f for f in os.listdir(library_path) if os.path.isfile(os.path.join(library_path, f))]
+    if not files:
+        await interaction.response.send_message("❌ `library` 資料夾是空的！", ephemeral=True)
+        return
+
+    selected_file = random.choice(files)
+    file_path = os.path.join(library_path, selected_file)
+
+    try:
+        await interaction.response.defer()
+        await interaction.followup.send(
+            f"🎲 隨機抽到: `{selected_file}`",
+            file=discord.File(file_path),
+            view=RandomFileView()
+        )
+        logger.info(f"指令：/send_file 發送了 {selected_file} 到 {interaction.channel}")
+    except Exception as e:
+        await interaction.followup.send(f"❌ 發送失敗：{e}", ephemeral=True)
+        logger.exception(f"send_file 失敗: {e}")
+
 @bot.tree.command(name="set_msg", description="⚙️ 全局設定：更改預設的炸頻內容清單 (使用空格分隔多條內容)")
 @discord.app_commands.describe(text="範例: 內容一 內容二 內容三 (機器人會隨機挑選發送)")
 async def set_msg_command(interaction: discord.Interaction, text: str):
@@ -406,24 +459,25 @@ async def set_msg_command(interaction: discord.Interaction, text: str):
     await interaction.response.send_message(f"✅ 預設內容已更新！現在包含 `{len(MESSAGES)}` 條訊息。", ephemeral=True)
     logger.info(f"指令：更新全局訊息清單為: {MESSAGES}")
 
-@tasks.loop(seconds=1.0)
+BURST_PER_TICK = 3  # 每次 tick 每個頻道發送幾條（調高=更快，但容易被 rate limit）
+
+@tasks.loop(seconds=0.5)  # 原本 1.0s，改為 0.5s → 頻率 x2
 async def spam_task():
-    # 處理頻道與私聊
     tasks_to_run = []
     
-    # 處理頻道
     for cid, data in list(active_spam_channels.items()):
-        msg = data["msg"] if data["msg"] else random.choice(MESSAGES)
-        tasks_to_run.append(data["obj"].send(msg))
+        # 每個頻道一次發 BURST_PER_TICK 條
+        for _ in range(BURST_PER_TICK):
+            msg = data["msg"] if data["msg"] else random.choice(MESSAGES)
+            tasks_to_run.append(data["obj"].send(msg))
             
     if tasks_to_run:
-        logger.info(f"[spam_task] 嘗試發送到 {len(tasks_to_run)} 個目標")
         results = await asyncio.gather(*tasks_to_run, return_exceptions=True)
-        for r in results:
-            if isinstance(r, Exception):
-                logger.warning(f"[spam_task] 發送失敗: {type(r).__name__}: {r}")
+        fails = sum(1 for r in results if isinstance(r, Exception))
+        if fails:
+            logger.warning(f"[spam_task] {fails}/{len(tasks_to_run)} 條發送失敗（可能 rate limit）")
 
-@tasks.loop(seconds=1.0)
+@tasks.loop(seconds=0.5)  # 原本 1.0s，改為 0.5s
 async def webhook_spam_task():
     if not active_webhooks:
         return
@@ -431,12 +485,14 @@ async def webhook_spam_task():
     async with aiohttp.ClientSession() as session:
         tasks_to_run = []
         for url, data in list(active_webhooks.items()):
-            msg = data["msg"] if data["msg"] else random.choice(MESSAGES)
-            payload = {
-                "content": msg,
-                "username": data["nick"]
-            }
-            tasks_to_run.append(session.post(url, json=payload))
+            # 每個 webhook 也一次打 BURST_PER_TICK 條
+            for _ in range(BURST_PER_TICK):
+                msg = data["msg"] if data["msg"] else random.choice(MESSAGES)
+                payload = {
+                    "content": msg,
+                    "username": data["nick"]
+                }
+                tasks_to_run.append(session.post(url, json=payload))
             
         if tasks_to_run:
             await asyncio.gather(*tasks_to_run, return_exceptions=True)
@@ -565,10 +621,8 @@ def play_next_audio(guild: discord.Guild):
         def after_playing(error):
             if error:
                 logger.error(f"[輪播錯誤] {error}")
-            # 等待 1 秒後撥放下一首，避免被 API Rate Limit，使用 asyncio run_coroutine_threadsafe
             if guild.id in active_audio_guilds:
-                # 使用 bot 的 event loop 重新調用 play_next_audio
-                bot.loop.call_later(1.0, play_next_audio, guild)
+                bot.loop.call_later(0.1, play_next_audio, guild)  # 0.1s 接續下一首（原本 1.0s）
 
         if not voice_client.is_playing():
             voice_client.play(audio_source, after=after_playing)
