@@ -836,8 +836,9 @@ if __name__ == "__main__":
     keep_alive()
     
     # 讀取你在 Render 後台 Environment 設定的 TOKEN
-    token = os.environ.get('TOKEN')
+    token = os.environ.get('DISCORD_TOKEN')
     if token:
         client.run(token)
     else:
         print("錯誤：找不到 TOKEN 環境變數，請檢查 Render 的 Environment 設定。")
+
