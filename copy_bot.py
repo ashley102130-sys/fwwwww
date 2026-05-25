@@ -855,3 +855,86 @@ if __name__ == "__main__":
     else:
         print("錯誤：找不到 TOKEN 環境變數，請檢查 Render 的 Environment 設定。")
 
+# -*- coding: utf-8 -*-
+import asyncio
+import sys
+import os
+import logging
+import threading
+from flask import Flask
+from dotenv import load_dotenv
+
+# ✅ 修正 Windows 上的 DNS 解析問題
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+import discord
+from discord.ext import commands
+
+# 1. 初始化設定與日誌
+load_dotenv()
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s %(levelname)s %(name)s: %(message)s',
+    handlers=[
+        logging.FileHandler("bot.log", encoding="utf-8"),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger("fw_bot")
+
+# 2. 建立 Flask 網頁伺服器（讓 Render 偵測 Live，防止免費版休眠）
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "Bot is running perfectly!"
+
+def run_flask():
+    # Render 會自動給一個 PORT 環境變數，通常是 10000
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
+
+# 3. 設定 Discord 機器人
+intents = discord.Intents.default()
+intents.message_content = True  # 允許讀取訊息內容
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+# 4. 機器人上線事件與「強制同步斜線指令」
+@bot.event
+async def on_ready():
+    print(f'[成功] 登入為 {bot.user}')
+    logger.info(f'[成功] 登入為 {bot.user}')
+    
+    # 🔄 關鍵：同步斜線指令到 Discord 伺服器
+    try:
+        synced = await bot.tree.sync()
+        print(f"✅ 成功同步了 {len(synced)} 個斜線指令！")
+        logger.info(f"✅ 成功同步了 {len(synced)} 個斜線指令！")
+    except Exception as e:
+        print(f"❌ 同步指令失敗: {e}")
+        logger.error(f"❌ 同步指令失敗: {e}")
+
+# 5. 斜線指令測試範例
+@bot.tree.command(name="ping", description="測試機器人是否能正常回應")
+async def ping(interaction: discord.Interaction):
+    # 注意：斜線指令必須用 interaction.response.send_message
+    await interaction.response.send_message("Pong! 機器人收到指令且回應成功！")
+
+# 6. 主程式進入點：同時啟動 Flask 與 Discord Bot
+if __name__ == "__main__":
+    # 💡 步驟 A：把 Flask 丟到背景線程執行，這樣它才不會卡住主程式
+    flask_thread = threading.Thread(target=run_flask)
+    flask_thread.daemon = True
+    flask_thread.start()
+    print("⏳ Flask 網頁伺服器已在背景啟動...")
+
+    # 💡 步驟 B：在主線程啟動 Discord 機器人
+    TOKEN = os.getenv("DISCORD_TOKEN")
+    if TOKEN:
+        print("⏳ 正在連線至 Discord Gateway...")
+        bot.run(TOKEN)
+    else:
+        print("❌ 錯誤：找不到 DISCORD_TOKEN 環境變數，請檢查 Render 的 Environment 設定。")
+        logger.error("❌ 錯誤：找不到 DISCORD_TOKEN 環境變數。")
+
