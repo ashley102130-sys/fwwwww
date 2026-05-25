@@ -30,7 +30,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger("fw_bot")
 
-# ====================== 修改這裡 ======================
+@bot.event
+async def on_ready():
+    print(f'{bot.user} 已上線')
+    try:
+        # 必須同步指令，程式才能真正接收到 Discord 傳來的斜線訊號
+        synced = await bot.tree.sync()
+        print(f"成功同步了 {len(synced)} 個指令")
+    except Exception as e:
+        print(e)
 
 # 從環境變數讀取 TOKEN
 def load_token():
