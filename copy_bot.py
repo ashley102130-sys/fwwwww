@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+from asyncio import subprocess
+from asyncio import subprocess
 import asyncio
 import sys
 
@@ -797,54 +799,45 @@ def play_next_audio(guild: discord.Guild):
         # 如果出錯，過幾秒再試一次
         bot.loop.call_later(3.0, play_next_audio, guild)
 
-# --- Render Web Service 用的簡易 HTTP 伺服器 ---
-import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
 import os
+import discord
+from flask import Flask
+from threading import Thread
 
-class PingHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header('Content-type', 'text/plain; charset=utf-8')
-        self.end_headers()
-        self.wfile.write(b"Bot is alive! Hosted on Render.")
-        
-    def log_message(self, format, *args):
-        pass  # 關閉 HTTP 請求日誌以防洗頻
+# 1. 建立 Flask 網頁伺服器，讓 Render 偵測到 Port
+app = Flask('')
 
-def run_web_server():
-    port = int(os.environ.get("PORT", 8080)) # Render 預設會帶 PORT 環境變數
-    server = HTTPServer(('0.0.0.0', port), PingHandler)
-    logger.info(f"🌐 簡易 Web 伺服器啟動於 port {port} (支援 Render)")
-    server.serve_forever()
+@app.route('/')
+def home():
+    return "機器人 24H 運作中！"
+
+def run():
+    # 從 Render 環境變數讀取 PORT，沒讀到則預設 10000
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port)
 
 def keep_alive():
-    t = threading.Thread(target=run_web_server)
-    t.daemon = True
+    t = Thread(target=run)
     t.start()
-# ---------------------------------------------
 
+# 2. Discord 機器人設定
+# 記得要在 Discord Developer Portal 開啟 Message Content Intent
+intents = discord.Intents.default()
+intents.message_content = True
+client = discord.Client(intents=intents)
+
+@client.event
+async def on_ready():
+    print(f'[成功] 登入為 {client.user}')
+
+# 3. 執行部分
 if __name__ == "__main__":
-    if not TOKEN.strip():
-        logger.error("錯誤：TOKEN 為空，請檢查 .env 檔案")
-        sys.exit(1)
-        
-    # 啟動 Web 伺服器來滿足 Render Web Service 需要綁定 Port 的需求
+    # 先啟動背景網頁伺服器
     keep_alive()
-        
-    try:
-        bot.run(TOKEN)
-    except discord.PrivilegedIntentsRequired:
-        logger.error("\n" + "="*50 +
-                     "\n❌ 啟動失敗：缺少「Message Content Intent」權限！"
-                     "\n請到 Discord Developer Portal 啟用它："
-                     "\n1. 進入 https://discord.com/developers/applications"
-                     "\n2. 選擇你的 Bot -> Bot 分頁"
-                     "\n3. 找到 'Privileged Gateway Intents' 區塊"
-                     "\n4. 開啟 'Message Content Intent'"
-                     "\n5. 儲存變更後重新執行腳本。"
-                     "\n" + "="*50)
-    except discord.LoginFailure:
-        logger.error("❌ 登入失敗！機器人 Token 可能錯誤。")
-    except Exception as e:
-        logger.exception("❌ 發生未知的嚴重錯誤")
+    
+    # 讀取你在 Render 後台 Environment 設定的 TOKEN
+    token = os.environ.get('TOKEN')
+    if token:
+        client.run(token)
+    else:
+        print("錯誤：找不到 TOKEN 環境變數，請檢查 Render 的 Environment 設定。")
