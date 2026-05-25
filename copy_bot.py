@@ -807,7 +807,7 @@ from threading import Thread
 # 1. 建立 Flask 網頁伺服器，讓 Render 偵測到 Port
 app = Flask('')
 
-@app.route('/')
+@app.route('/', methods=['GET', 'HEAD'])
 def home():
     return "機器人 24H 運作中！"
 
