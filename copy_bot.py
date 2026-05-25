@@ -30,15 +30,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger("fw_bot")
 
+import discord
+from discord.ext import commands
+
+# 1. 先設定 intents
+intents = discord.Intents.default()
+intents.message_content = True  # 如果有需要讀取訊息內容
+
+# 2. 正確宣告 bot 變數（注意這裡的名字必須是 bot）
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+# 3. 接下來才能使用 @bot.event
 @bot.event
 async def on_ready():
-    print(f'{bot.user} 已上線')
-    try:
-        # 必須同步指令，程式才能真正接收到 Discord 傳來的斜線訊號
-        synced = await bot.tree.sync()
-        print(f"成功同步了 {len(synced)} 個指令")
-    except Exception as e:
-        print(e)
+    print(f'{bot.user} 已成功上線！')
 
 # 從環境變數讀取 TOKEN
 def load_token():
