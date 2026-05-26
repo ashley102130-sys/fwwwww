@@ -147,6 +147,15 @@ async def on_ready():
     logger.info("🤖 機器人已準備就緒！")
     logger.info("可用指令：/use, /nuke, /raid, /stop, /stop_all, /clear, /webhook_use")
 
+@bot.tree.command(name="ping", description="測試回應")
+async def ping(interaction: discord.Interaction):
+    # 關鍵：先跟 Discord 說「收到請求了，處理中」
+    # 這會讓 Discord 的「未回應」錯誤消失，變成「機器人正在思考...」
+    await interaction.response.defer(ephemeral=False) 
+
+    # 處理完後再發送
+    await interaction.followup.send("Pong! 機器人連線正常！")
+
 @bot.event
 async def on_voice_state_update(member, before, after):
     # 如果是機器人自己變更狀態，不處理
