@@ -1,3 +1,14 @@
+import os
+import sys
+
+# 強制印出第一行，確認檔案有在動
+print(">>> 程式已成功啟動！正在初始化...")
+sys.stdout.flush() 
+
+# 檢查檔案路徑
+print(f">>> 目前執行的檔案路徑: {os.path.abspath(__file__)}")
+sys.stdout.flush()
+
 # -*- coding: utf-8 -*-
 from asyncio import subprocess
 from asyncio import subprocess
