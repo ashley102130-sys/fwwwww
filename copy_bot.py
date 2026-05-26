@@ -938,3 +938,8 @@ if __name__ == "__main__":
         print("❌ 錯誤：找不到 DISCORD_TOKEN 環境變數，請檢查 Render 的 Environment 設定。")
         logger.error("❌ 錯誤：找不到 DISCORD_TOKEN 環境變數。")
 
+@bot.event
+async def on_interaction(interaction):
+    # 這行會強迫 Log 印出所有收到的互動
+    logger.info(f"收到互動請求: {interaction.type} 來自用戶 {interaction.user}")
+    await bot.process_application_commands(interaction)
