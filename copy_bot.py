@@ -1,13 +1,15 @@
 import os
 import sys
-
-# 強制印出第一行，確認檔案有在動
-print(">>> 程式已成功啟動！正在初始化...")
-sys.stdout.flush() 
-
-# 檢查檔案路徑
-print(f">>> 目前執行的檔案路徑: {os.path.abspath(__file__)}")
-sys.stdout.flush()
+@bot.event
+async def on_ready():
+    print(f'>>> [1] 機器人登入成功: {bot.user}')
+    print(f'>>> [2] 正在嘗試同步指令...')
+    try:
+        # 同步全域指令
+        synced = await bot.tree.sync()
+        print(f">>> [3] 同步完成！共同步了 {len(synced)} 個指令。")
+    except Exception as e:
+        print(f">>> [X] 同步過程發生錯誤: {e}")
 
 # -*- coding: utf-8 -*-
 from asyncio import subprocess
