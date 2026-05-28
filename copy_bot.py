@@ -1,16 +1,3 @@
-import os
-import sys
-@bot.event
-async def on_ready():
-    print(f'>>> [1] 機器人登入成功: {bot.user}')
-    print(f'>>> [2] 正在嘗試同步指令...')
-    try:
-        # 同步全域指令
-        synced = await bot.tree.sync()
-        print(f">>> [3] 同步完成！共同步了 {len(synced)} 個指令。")
-    except Exception as e:
-        print(f">>> [X] 同步過程發生錯誤: {e}")
-
 # -*- coding: utf-8 -*-
 from asyncio import subprocess
 from asyncio import subprocess
@@ -19,6 +6,7 @@ import sys
 
 # ✅ 修正 Windows 上 aiohttp DNS 解析失敗的問題 (ProactorEventLoop 不相容)
 if sys.platform == "win32":
+    sys.stdout.reconfigure(encoding='utf-8')
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 import discord
 from discord.ext import commands, tasks
@@ -152,22 +140,14 @@ class MyBot(commands.Bot):
         else:
             logger.info("✅ Opus 編解碼器已就緒")
 
-bot = MyBot()
+# 1. 先定義 bot
+intents = discord.Intents.all()
+bot = commands.Bot(command_prefix="!", intents=intents)
 
-@bot.event
-async def on_ready():
-    logger.info(f"✅ 成功登入為 {bot.user} (ID: {bot.user.id})")
-    logger.info("🤖 機器人已準備就緒！")
-    logger.info("可用指令：/use, /nuke, /raid, /stop, /stop_all, /clear, /webhook_use")
-
-@bot.tree.command(name="ping", description="測試回應")
+# 2. 然後才定義指令（使用剛定義好的 bot）
+@bot.tree.command(name="ping", description="測試")
 async def ping(interaction: discord.Interaction):
-    # 關鍵：先跟 Discord 說「收到請求了，處理中」
-    # 這會讓 Discord 的「未回應」錯誤消失，變成「機器人正在思考...」
-    await interaction.response.defer(ephemeral=False) 
-
-    # 處理完後再發送
-    await interaction.followup.send("Pong! 機器人連線正常！")
+    await interaction.response.send_message("Pong!")
 
 @bot.event
 async def on_voice_state_update(member, before, after):
@@ -834,78 +814,11 @@ def play_next_audio(guild: discord.Guild):
         # 如果出錯，過幾秒再試一次
         bot.loop.call_later(3.0, play_next_audio, guild)
 
+
 import os
-import discord
-from flask import Flask
-from threading import Thread
-
-# 1. 建立 Flask 網頁伺服器，讓 Render 偵測到 Port
-app = Flask('')
-
-@app.route('/', methods=['GET', 'HEAD'])
-def home():
-    return "機器人 24H 運作中！"
-
-def run():
-    # 從 Render 環境變數讀取 PORT，沒讀到則預設 10000
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host='0.0.0.0', port=port)
-
-def keep_alive():
-    t = Thread(target=run)
-    t.start()
-
-# 2. Discord 機器人設定
-# 記得要在 Discord Developer Portal 開啟 Message Content Intent
-intents = discord.Intents.default()
-intents.message_content = True
-client = discord.Client(intents=intents)
-
-@client.event
-async def on_ready():
-    print(f'[成功] 登入為 {client.user}')
-
-# 3. 執行部分
-if __name__ == "__main__":
-    # 先啟動背景網頁伺服器
-    keep_alive()
-    
-    # 讀取你在 Render 後台 Environment 設定的 TOKEN
-    token = os.environ.get('DISCORD_TOKEN')
-    if token:
-        client.run(token)
-    else:
-        print("錯誤：找不到 TOKEN 環境變數，請檢查 Render 的 Environment 設定。")
-
-# -*- coding: utf-8 -*-
-import asyncio
-import sys
-import os
-import logging
 import threading
 from flask import Flask
-from dotenv import load_dotenv
 
-# ✅ 修正 Windows 上的 DNS 解析問題
-if sys.platform == "win32":
-    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-
-import discord
-from discord.ext import commands
-
-# 1. 初始化設定與日誌
-load_dotenv()
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s %(levelname)s %(name)s: %(message)s',
-    handlers=[
-        logging.FileHandler("bot.log", encoding="utf-8"),
-        logging.StreamHandler(sys.stdout)
-    ]
-)
-logger = logging.getLogger("fw_bot")
-
-# 2. 建立 Flask 網頁伺服器（讓 Render 偵測 Live，防止免費版休眠）
 app = Flask(__name__)
 
 @app.route('/')
@@ -913,55 +826,36 @@ def home():
     return "Bot is running perfectly!"
 
 def run_flask():
-    # Render 會自動給一個 PORT 環境變數，通常是 10000
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
 
-# 3. 設定 Discord 機器人
-intents = discord.Intents.default()
-intents.message_content = True  # 允許讀取訊息內容
-bot = commands.Bot(command_prefix="!", intents=intents)
-
-# 4. 機器人上線事件與「強制同步斜線指令」
 @bot.event
 async def on_ready():
-    print(f'[成功] 登入為 {bot.user}')
-    logger.info(f'[成功] 登入為 {bot.user}')
-    
-    # 🔄 關鍵：同步斜線指令到 Discord 伺服器
+    print(f'>>> [1] 機器人登入成功: {bot.user}')
+    logger.info(f'>>> [1] 機器人登入成功: {bot.user}')
+    print(f'>>> [2] 正在嘗試同步指令...')
     try:
         synced = await bot.tree.sync()
-        print(f"✅ 成功同步了 {len(synced)} 個斜線指令！")
+        print(f">>> [3] 同步完成！共同步了 {len(synced)} 個指令。")
         logger.info(f"✅ 成功同步了 {len(synced)} 個斜線指令！")
     except Exception as e:
-        print(f"❌ 同步指令失敗: {e}")
-        logger.error(f"❌ 同步指令失敗: {e}")
+        print(f">>> [X] 同步過程發生錯誤: {e}")
+        logger.error(f"❌ 同步過程發生錯誤: {e}")
 
-# 5. 斜線指令測試範例
-@bot.tree.command(name="ping", description="測試機器人是否能正常回應")
-async def ping(interaction: discord.Interaction):
-    # 注意：斜線指令必須用 interaction.response.send_message
-    await interaction.response.send_message("Pong! 機器人收到指令且回應成功！")
+@bot.event
+async def on_interaction(interaction):
+    logger.info(f"收到互動請求: {interaction.type} 來自用戶 {interaction.user}")
+    await bot.process_application_commands(interaction)
 
-# 6. 主程式進入點：同時啟動 Flask 與 Discord Bot
 if __name__ == "__main__":
-    # 💡 步驟 A：把 Flask 丟到背景線程執行，這樣它才不會卡住主程式
     flask_thread = threading.Thread(target=run_flask)
     flask_thread.daemon = True
     flask_thread.start()
     print("⏳ Flask 網頁伺服器已在背景啟動...")
 
-    # 💡 步驟 B：在主線程啟動 Discord 機器人
-    TOKEN = os.getenv("DISCORD_TOKEN")
     if TOKEN:
         print("⏳ 正在連線至 Discord Gateway...")
         bot.run(TOKEN)
     else:
-        print("❌ 錯誤：找不到 DISCORD_TOKEN 環境變數，請檢查 Render 的 Environment 設定。")
+        print("❌ 錯誤：找不到 DISCORD_TOKEN 環境變數。")
         logger.error("❌ 錯誤：找不到 DISCORD_TOKEN 環境變數。")
-
-@bot.event
-async def on_interaction(interaction):
-    # 這行會強迫 Log 印出所有收到的互動
-    logger.info(f"收到互動請求: {interaction.type} 來自用戶 {interaction.user}")
-    await bot.process_application_commands(interaction)
